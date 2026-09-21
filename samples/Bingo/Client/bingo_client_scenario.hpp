@@ -1,0 +1,375 @@
+/* SPDX-License-Identifier: FSL-1.1-ALv2 */
+#pragma once
+
+#include "bingo_client_options.hpp"
+#include "../Shared/Contracts/messages.hpp"
+#include <zlink/codecs/protobuf.hpp>
+
+#include <zlink/stream_e2e_client/codecs/auto_codec.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <iostream>
+#include <source_location>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+#define ensure(condition) ensure ((condition), #condition)
+
+namespace zlink::samples::bingo
+{
+
+class bingo_client_scenario_t
+{
+    using player_joined_message_t = zlink::stream_connector::message_t<player_joined_notify_t>;
+    using bingo_reward_announced_message_t =
+      zlink::stream_connector::message_t<bingo_reward_announced_notify_t>;
+    using number_drawn_message_t = zlink::stream_connector::message_t<number_drawn_notify_t>;
+    using game_ended_message_t = zlink::stream_connector::message_t<game_ended_notify_t>;
+    using observer_returned_to_entry_spot_message_t =
+      zlink::stream_connector::message_t<observer_returned_to_entry_spot_notify_t>;
+
+  public:
+    bool run (stream_e2e_client::coroutine_connector_t &client1,
+              stream_e2e_client::coroutine_connector_t &client2,
+              stream_e2e_client::coroutine_connector_t &observer)
+    {
+        auto result = run_async (client1, client2, observer).result ();
+        return result && result.value ();
+    }
+
+#undef ensure
+  private:
+    static stream_e2e_client::task_t<bool>
+    run_async (stream_e2e_client::coroutine_connector_t &client1,
+               stream_e2e_client::coroutine_connector_t &client2,
+               stream_e2e_client::coroutine_connector_t &observer)
+    {
+        try {
+            const std::vector<int> client1_card_numbers{1, 2, 3, 4, 0, 6, 7, 8, 9};
+            const std::vector<int> client2_card_numbers{10, 11, 12, 13, 0, 14, 4, 5, 6};
+
+            trace ("connect client1");
+            co_await client1.connect ().async ();
+            trace ("connect client2");
+            co_await client2.connect ().async ();
+            trace ("connect observer");
+            co_await observer.connect ().async ();
+
+            /* 세 client를 인증한 뒤 global ActorId로 matching을 진행한다. Object owner는
+             * Location Store가 결정하므로 application scenario가 NodeRid를 비교하지 않는다. */
+            trace ("authenticate client1");
+            authenticate_req_t client1_auth_request;
+            client1_auth_request.set_access_token (bingo_sample_players_t::player1);
+            auto client1_auth = co_await authenticate (client1, client1_auth_request);
+            ensure (client1_auth.actor_id () == bingo_sample_players_t::player1);
+            std::cout << "stream-result sample=Bingo client=player1 operation=authenticate"
+                      << std::endl;
+
+            trace ("authenticate client2");
+            authenticate_req_t client2_auth_request;
+            client2_auth_request.set_access_token (bingo_sample_players_t::player2);
+            auto client2_auth = co_await authenticate (client2, client2_auth_request);
+            ensure (client2_auth.actor_id () == bingo_sample_players_t::player2);
+            ensure (client2_auth.actor_id () != client1_auth.actor_id ());
+
+            trace ("authenticate observer");
+            authenticate_req_t observer_auth_request;
+            observer_auth_request.set_access_token (bingo_sample_players_t::observer);
+            auto observer_auth = co_await authenticate (observer, observer_auth_request);
+            ensure (observer_auth.actor_id () == bingo_sample_players_t::observer);
+
+            trace ("match client1");
+            match_bingo_req_t client1_match_request;
+            client1_match_request.set_mode (bingo_sample_modes_t::two_player);
+            auto client1_match =
+              co_await client1.request (client1_match_request).async<match_bingo_res_t> ();
+            ensure (client1_match.state ().status () == bingo_room_status_t::waiting);
+            ensure (client1_match.state ().host_actor_id () == client1_auth.actor_id ());
+            co_await client1.expect_none<player_joined_notify_t> ()
+              .within (std::chrono::milliseconds (25))
+              .async ();
+
+
+            trace ("observe reward events");
+            observe_bingo_events_req_t observe_request;
+            observe_request.set_room_id (client1_match.room_id ());
+            auto observed =
+              co_await observer.request (observe_request).async<observe_bingo_events_res_t> ();
+            ensure (observed.subscribed ());
+
+            trace ("match client2");
+            auto client1_joined_task =
+              client1.wait_for<player_joined_notify_t> ()
+                .where ([&client2_auth] (const player_joined_message_t &message) {
+                    const auto &payload = message.payload;
+                    return payload.actor_id () == client2_auth.actor_id ();
+                })
+                .async ();
+            auto client1_started_task = client1.wait_for<game_started_notify_t> ().async ();
+            auto client2_started_task = client2.wait_for<game_started_notify_t> ().async ();
+            match_bingo_req_t match_request;
+            match_request.set_mode (bingo_sample_modes_t::two_player);
+            auto client2_match =
+              co_await client2.request (match_request).async<match_bingo_res_t> ();
+            ensure (client2_match.room_id () == client1_match.room_id ());
+            // The join is deferred until the MatchBingo handler completes. The
+            // GameStarted notification below is the public completion signal.
+            ensure (client2_match.state ().status () == bingo_room_status_t::waiting);
+            auto client1_joined = co_await client1_joined_task;
+            auto client1_started = co_await client1_started_task;
+            auto client2_started = co_await client2_started_task;
+            co_await client2.expect_none<player_joined_notify_t> ()
+              .within (std::chrono::milliseconds (25))
+              .async ();
+            const auto room_id = client1_match.room_id ();
+            trace ("client1 wait joined");
+            ensure (client1_joined.payload.actor_id () == client2_auth.actor_id ());
+            ensure (std::all_of (client1_joined.payload.state ().players ().begin (),
+                                 client1_joined.payload.state ().players ().end (),
+                                 [] (const bingo_player_state_message_t &player) {
+                                     return player.wins () == 0 && player.losses () == 0;
+                                 }));
+            std::cout << "stream-handler sample=Bingo client=player1 message=PlayerJoinedNotify"
+                      << std::endl;
+
+            trace ("wait game started");
+            ensure (client1_started.payload.state ().room_id () == room_id);
+            ensure (client1_started.payload.state ().status () == bingo_room_status_t::running);
+            ensure (client2_started.payload.state ().room_id () == room_id);
+            ensure (client2_started.payload.state ().status () == bingo_room_status_t::running);
+            ensure (client2_match.state ().room_id () == room_id);
+
+            bool player_stop_observing_rejected = false;
+            try {
+                stop_observing_bingo_events_req_t stop;
+                stop.set_room_id (room_id);
+                (void) co_await client1.request (stop).async<stop_observing_bingo_events_res_t> ();
+            }
+            catch (const std::exception &) {
+                player_stop_observing_rejected = true;
+            }
+            ensure (player_stop_observing_rejected,
+                    "a game-room player must not stop an observer subscription");
+
+            trace ("client2 submit card");
+            submit_bingo_card_req_t client2_card_request;
+            client2_card_request.set_room_id (room_id);
+            client2_card_request.mutable_card ()->Assign (client2_card_numbers.begin (),
+                                                          client2_card_numbers.end ());
+            auto client2_card =
+              co_await client2.request (client2_card_request).async<submit_bingo_card_res_t> ();
+            ensure (client2_card.state ().status () == bingo_room_status_t::running);
+            ensure (std::any_of (client2_card.state ().players ().begin (),
+                                 client2_card.state ().players ().end (),
+                                 [&client2_auth] (const bingo_player_state_message_t &player) {
+                                     return player.actor_id () == client2_auth.actor_id ()
+                                            && player.card_size () == 9;
+                                 }));
+
+            bool duplicate_card_rejected = false;
+            try {
+                (void) co_await client2.request (client2_card_request)
+                  .async<submit_bingo_card_res_t> ();
+            }
+            catch (const std::exception &) {
+                duplicate_card_rejected = true;
+            }
+            ensure (duplicate_card_rejected, "a player must not replace a submitted card");
+
+            trace ("client1 submit card");
+            constexpr int expected_draw_count = 3;
+            auto reward_task =
+              observer.wait_for<bingo_reward_announced_notify_t> ()
+                .where ([&room_id] (const bingo_reward_announced_message_t &message) {
+                    const auto &payload = message.payload;
+                    return payload.room_id () == room_id;
+                })
+                .async ();
+            std::vector<zlink::stream_e2e_client::task_t<
+              zlink::stream_connector::message_t<number_drawn_notify_t>>>
+              client1_draw_tasks;
+            std::vector<zlink::stream_e2e_client::task_t<
+              zlink::stream_connector::message_t<number_drawn_notify_t>>>
+              client2_draw_tasks;
+            client1_draw_tasks.reserve (expected_draw_count);
+            client2_draw_tasks.reserve (expected_draw_count);
+            for (int draw_seq = 1; draw_seq <= expected_draw_count; ++draw_seq) {
+                client1_draw_tasks.push_back (
+                  client1.wait_for<number_drawn_notify_t> ()
+                    .where ([draw_seq] (const number_drawn_message_t &message) {
+                        const auto &payload = message.payload;
+                        return payload.draw_seq () == draw_seq;
+                    })
+                    .async ());
+                client2_draw_tasks.push_back (
+                  client2.wait_for<number_drawn_notify_t> ()
+                    .where ([draw_seq] (const number_drawn_message_t &message) {
+                        const auto &payload = message.payload;
+                        return payload.draw_seq () == draw_seq;
+                    })
+                    .async ());
+            }
+            auto client1_ended_task =
+              client1.wait_for<game_ended_notify_t> ()
+                .where ([] (const game_ended_message_t &message) {
+                    const auto &payload = message.payload;
+                    return payload.state ().status () == bingo_room_status_t::finished;
+                })
+                .async ();
+            auto client2_ended_task =
+              client2.wait_for<game_ended_notify_t> ()
+                .where ([] (const game_ended_message_t &message) {
+                    const auto &payload = message.payload;
+                    return payload.state ().status () == bingo_room_status_t::finished;
+                })
+                .async ();
+            submit_bingo_card_req_t client1_card_request;
+            client1_card_request.set_room_id (room_id);
+            client1_card_request.mutable_card ()->Assign (client1_card_numbers.begin (),
+                                                          client1_card_numbers.end ());
+            auto client1_card =
+              co_await client1.request (client1_card_request).async<submit_bingo_card_res_t> ();
+            // Drawing is server-driven after both cards arrive; the submit reply
+            // still reflects the running game (same as the .NET scenario).
+            ensure (client1_card.state ().status () == bingo_room_status_t::running);
+            ensure (client1_card.state ().players_size () == 2);
+            ensure (std::all_of (client1_card.state ().players ().begin (),
+                                 client1_card.state ().players ().end (),
+                                 [] (const bingo_player_state_message_t &player) {
+                                     return player.card_size () == 9;
+                                 }));
+            std::vector<number_drawn_notify_t> drawn_numbers;
+            for (int draw_seq = 1; draw_seq <= expected_draw_count; ++draw_seq) {
+                auto client1_drawn =
+                  (co_await client1_draw_tasks[static_cast<std::size_t> (draw_seq - 1)]).payload;
+                auto client2_drawn =
+                  (co_await client2_draw_tasks[static_cast<std::size_t> (draw_seq - 1)]).payload;
+                drawn_numbers.push_back (client1_drawn);
+                ensure (client1_drawn.draw_seq () == draw_seq);
+                ensure (client2_drawn.draw_seq () == draw_seq);
+                ensure (client2_drawn.number () == client1_drawn.number ());
+                ensure (same_bingo_room_state (client1_drawn.state (), client2_drawn.state ()));
+            }
+            ensure (drawn_numbers.size () == expected_draw_count);
+            ensure (drawn_numbers.back ().state ().status () == bingo_room_status_t::finished);
+            auto client1_ended = co_await client1_ended_task;
+            auto client2_ended = co_await client2_ended_task;
+            ensure (client1_ended.payload.state ().status () == bingo_room_status_t::finished);
+            ensure (client2_ended.payload.state ().status () == bingo_room_status_t::finished);
+            ensure (std::equal (client2_ended.payload.state ().drawn_numbers ().begin (),
+                                client2_ended.payload.state ().drawn_numbers ().end (),
+                                client1_ended.payload.state ().drawn_numbers ().begin (),
+                                client1_ended.payload.state ().drawn_numbers ().end ()));
+            ensure (std::equal (client2_ended.payload.state ().winners ().begin (),
+                                client2_ended.payload.state ().winners ().end (),
+                                client1_ended.payload.state ().winners ().begin (),
+                                client1_ended.payload.state ().winners ().end ()));
+            ensure (same_bingo_player_list (client1_ended.payload.state ().players (),
+                                            client2_ended.payload.state ().players ()));
+            ensure (static_cast<std::size_t> (client1_ended.payload.state ().drawn_numbers_size ())
+                    == drawn_numbers.size ());
+            for (std::size_t index = 0; index < drawn_numbers.size (); ++index) {
+                ensure (client1_ended.payload.state ().drawn_numbers (static_cast<int> (index))
+                        == drawn_numbers[index].number ());
+            }
+            // Final results are validated on the pushed game-ended state, matching
+            // the .NET scenario: winners, full cards, and the marked free cell.
+            ensure (!client1_ended.payload.state ().drawn_numbers ().empty ());
+            ensure (client1_ended.payload.state ().winners_size () == 1
+                    && client1_ended.payload.state ().winners (0) == client1_auth.actor_id ());
+            ensure (std::all_of (client1_ended.payload.state ().players ().begin (),
+                                 client1_ended.payload.state ().players ().end (),
+                                 [] (const bingo_player_state_message_t &player) {
+                                     return player.card_size () == 9 && player.marks_size () == 9
+                                            && player.marks (4);
+                                 }));
+
+            trace ("wait reward announcement");
+            auto reward = co_await reward_task;
+            ensure (reward.payload.actor_id () == client1_auth.actor_id ());
+            ensure (reward.payload.draw_seq () == client1_ended.payload.state ().draw_seq ());
+            ensure (reward.payload.item_id () == bingo_reward_items_t::golden_dauber_id);
+            ensure (reward.payload.item_name () == bingo_reward_items_t::golden_dauber_name);
+            ensure (reward.payload.rarity () == bingo_reward_items_t::legendary_rarity);
+
+            trace ("stop observing");
+            stop_observing_bingo_events_req_t stop_observing_request;
+            stop_observing_request.set_room_id (room_id);
+            auto observer_returned_to_entry =
+              observer.wait_for<observer_returned_to_entry_spot_notify_t> ()
+                .where (
+                  [&observer_auth] (const observer_returned_to_entry_spot_message_t &message) {
+                      const auto &payload = message.payload;
+                      return payload.actor_id () == observer_auth.actor_id ();
+                  })
+                .async ();
+            auto stopped = co_await observer.request (stop_observing_request)
+                             .async<stop_observing_bingo_events_res_t> ();
+            trace ("stop observing completed");
+            ensure (stopped.stopped ());
+
+            trace ("wait observer Entry Spot return");
+            const auto returned_to_entry = co_await observer_returned_to_entry;
+            ensure (returned_to_entry.payload.actor_id () == observer_auth.actor_id ());
+
+            co_await client1.close ().async ();
+            co_await client2.close ().async ();
+            co_await observer.close ().async ();
+            co_return true;
+        }
+        catch (const std::exception &ex) {
+            std::cerr << "bingo game failed: " << ex.what () << '\n';
+            (void) client1.close ();
+            (void) client2.close ();
+            (void) observer.close ();
+            co_return false;
+        }
+    }
+
+    static void ensure (bool condition, const char *expression)
+    {
+        if (!condition) {
+            throw std::runtime_error (std::string ("Ensure failed: ") + expression);
+        }
+    }
+
+    static bool same_bingo_player_list (
+      const google::protobuf::RepeatedPtrField<bingo_player_state_message_t> &left,
+      const google::protobuf::RepeatedPtrField<bingo_player_state_message_t> &right)
+    {
+        return left.size () == right.size ()
+               && std::equal (
+                 left.begin (), left.end (), right.begin (), [] (const auto &a, const auto &b) {
+                     return a.SerializeAsString () == b.SerializeAsString ();
+                 });
+    }
+
+    static bool same_bingo_room_state (const bingo_room_state_message_t &left,
+                                       const bingo_room_state_message_t &right)
+    {
+        return left.SerializeAsString () == right.SerializeAsString ();
+    }
+
+    static stream_e2e_client::task_t<authenticate_res_t>
+    authenticate (stream_e2e_client::coroutine_connector_t &client,
+                  const authenticate_req_t &request)
+    {
+        co_return co_await client.request (request).async<authenticate_res_t> ();
+    }
+
+    static void ensure (bool condition,
+                        std::source_location location = std::source_location::current ())
+    {
+        ensure (condition,
+                ("condition at " + std::string (location.file_name ()) + ":"
+                 + std::to_string (location.line ()))
+                  .c_str ());
+    }
+
+    static void trace (const char *step) { std::cerr << "bingo step: " << step << '\n'; }
+};
+
+} // namespace zlink::samples::bingo

@@ -1,0 +1,130 @@
+/* SPDX-License-Identifier: FSL-1.1-ALv2 */
+
+#include "../Configuration/sample_names.hpp"
+#include "../Configuration/sample_readiness.hpp"
+#include "../Configuration/sample_configuration.hpp"
+
+#include <zlink/framework.hpp>
+#include <zlink/locations/redis.hpp>
+
+#include <format>
+#include <iostream>
+#include <set>
+#include <string>
+
+namespace zlink::samples::deliverydispatch
+{
+
+using namespace framework;
+
+class courier_session_t final : public packet_stream_session_t
+{
+  public:
+    task_t<void> on_connected (stream_t &) override { co_return; }
+
+    task_t<void> on_disconnected (stream_t &) override
+    {
+        _bound_actors.clear ();
+        co_return;
+    }
+
+    task_t<void> on_error (stream_t &, const stream_error_t &) override { co_return; }
+
+    task_t<void> on_packet (stream_t &stream,
+                            const session_message_context_t &dispatch,
+                            const zlink::message_t &payload) override
+    {
+        const std::string line = std::format (
+          "deliverydispatch courier-session: dispatch packet={}\n", dispatch.packet_name);
+        std::cerr << line;
+        auto &actors = stream.actors ();
+        if (dispatch.packet_name == bind_courier_session_req_t::packet_name) {
+            // --8<-- [start:doc-dd-session-bind]
+            const auto request = payload.parse_json<bind_courier_session_req_t> ();
+            /* Global ActorId로 current owner를 찾거나 eligible node에 생성한다. Application은
+             * courier id에서 physical NodeRid를 계산하지 않는다. */
+            auto located = actors.get_or_create (sample_names_t::courier_actor_type,
+                                                 request.courier_id,
+                                                 ensure_courier_actor_req_t{request.courier_id});
+            if (!located) {
+                throw framework_exception_t (located.error_kind (),
+                                             located.error ()
+                                               ? located.error ()->what ()
+                                               : "courier actor could not be located");
+            }
+            /* Ready 결과의 exact ActorRef는 Framework session bind에만 사용한다. Application
+             * message나 client reply에는 ActorRef와 physical route를 넣지 않는다. */
+            auto actor = co_await actors.bind_or_get (located.value ().ref ()).async ();
+            const auto actor_id = std::string (actor.actor_id ());
+            _bound_actors.insert (actor_id);
+            auto reply = co_await actor
+                           .relay_request (bind_courier_session_req_t::packet_name,
+                                           zlink::message_t::from_json (
+                                             bind_courier_session_req_t{request.courier_id}))
+                           .async ();
+            stream.reply_packet (reply).async ();
+            const std::string line =
+              std::format ("deliverydispatch-courier bound courier={}\n", request.courier_id);
+            std::cerr << line;
+            // --8<-- [end:doc-dd-session-bind]
+            co_return;
+        }
+        if (dispatch.packet_name == courier_decision_msg_t::packet_name) {
+            auto actor = require_bound_actor (
+              stream, payload.parse_json<courier_decision_msg_t> ().courier_id);
+            co_await actor.relay (payload);
+            co_return;
+        }
+    }
+
+  private:
+    session_actor_t require_bound_actor (stream_t &stream, const std::string &actor_id)
+    {
+        if (!_bound_actors.contains (actor_id)) {
+            throw framework_exception_t (framework_error_kind_t::not_found,
+                                         "courier actor is not bound: " + actor_id);
+        }
+        auto actor = stream.actors ().find (actor_id);
+        if (!actor) {
+            throw framework_exception_t (framework_error_kind_t::not_found,
+                                         "bound courier actor route is not found: " + actor_id);
+        }
+        return *actor;
+    }
+
+    std::set<std::string> _bound_actors;
+};
+
+} // namespace zlink::samples::deliverydispatch
+
+int main (int argc, char **argv)
+{
+    using namespace zlink::framework;
+    using namespace zlink::samples::deliverydispatch;
+
+    auto app = app_t::create ();
+    const auto configuration = load_sample_configuration (app, argc, argv);
+    const auto &topology = configuration.topology;
+    app.logging ().use_file (configuration.flow_log_path ());
+    auto &options = app.add_zlink_framework ();
+    options.configure_dispatch ().message_flow (message_flow_log_mode_t::normal);
+    options.add_location_store<redis::redis_location_store_t> ()
+      .set_connection_string (topology.redis_endpoint)
+      .set_key_prefix (topology.redis_key_prefix);
+    auto actor_mesh = options.add_route_mesh (sample_names_t::courier_actor_discovery);
+    actor_mesh.set_routing_id (
+      zlink::routing_id_t::from (sample_names_t::courier_session_route_node));
+    actor_mesh.listen (topology.courier_session_spot_router_endpoint)
+      .channel (sample_names_t::courier_actor_discovery)
+      .client ();
+    actor_mesh.objects ().client ();
+    options.add_stream_node (sample_names_t::courier_stream_node)
+      .bind (topology.courier_stream_endpoint)
+      .register_session<courier_session_t> ();
+    app.add_hosted_service (std::make_unique<route_readiness_service_t> (
+      sample_names_t::courier_session_node,
+      sample_names_t::courier_actor_discovery,
+      std::vector<std::string>{sample_names_t::courier_actor_instance_1,
+                               sample_names_t::courier_actor_instance_2}));
+    return app.run (argc, argv);
+}

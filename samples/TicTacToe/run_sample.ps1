@@ -1,0 +1,289 @@
+$ErrorActionPreference = "Stop"
+. "$PSScriptRoot/../redis-common.ps1"
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$CppRoot = Get-ZlinkCppSampleTreeRoot
+$env:TICTACTOE_LOG_DIR = if ($env:TICTACTOE_LOG_DIR) { $env:TICTACTOE_LOG_DIR } else { Join-Path $ScriptDir "logs" }
+New-Item -ItemType Directory -Force -Path $env:TICTACTOE_LOG_DIR | Out-Null
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $env:TICTACTOE_LOG_DIR "*.log")
+
+$BuildDir = if ($env:ZLINK_CPP_BUILD_DIR) { $env:ZLINK_CPP_BUILD_DIR } else { Join-Path $CppRoot "build" }
+$BuildConfiguration = if ($env:ZLINK_CPP_BUILD_CONFIGURATION) { $env:ZLINK_CPP_BUILD_CONFIGURATION } else { "Release" }
+$BinDir = $BuildDir
+if (Test-Path (Join-Path $BuildDir "$BuildConfiguration/sample_cpp_framework_tictactoe_play.exe")) {
+    $BinDir = Join-Path $BuildDir $BuildConfiguration
+} elseif (-not (Test-Path (Join-Path $BinDir "sample_cpp_framework_tictactoe_play.exe")) -and
+    (Test-Path (Join-Path $BinDir "linux-ninja-debug/sample_cpp_framework_tictactoe_play.exe"))) {
+    $BinDir = Join-Path $BinDir "linux-ninja-debug"
+}
+
+$PlayBin = Join-Path $BinDir "sample_cpp_framework_tictactoe_play.exe"
+$ApiBin = Join-Path $BinDir "sample_cpp_framework_tictactoe_api.exe"
+$ClientBin = Join-Path $BinDir "sample_cpp_framework_tictactoe_client.exe"
+
+foreach ($Binary in @($PlayBin, $ApiBin, $ClientBin)) {
+    if (-not (Test-Path $Binary)) {
+        throw "Missing executable: $Binary. Build C++ samples first or set ZLINK_CPP_BUILD_DIR."
+    }
+}
+
+function Reserve-Ports([int]$Count) {
+    return @(Get-ZlinkSamplePorts -Count $Count)
+}
+
+function Get-EndpointParts([string]$Endpoint) {
+    $value = $Endpoint -replace '^tcp://', '' -replace '^http://', '' -replace '^redis://', ''
+    $index = $value.LastIndexOf(':')
+    return @{ Host = $value.Substring(0, $index); Port = [int]$value.Substring($index + 1) }
+}
+
+function Wait-Port([string]$Name, [string]$Endpoint, [int]$TimeoutSeconds = 30) {
+    $parts = Get-EndpointParts $Endpoint
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $client.BeginConnect($parts.Host, $parts.Port, $null, $null)
+            if ($connect.AsyncWaitHandle.WaitOne(200)) {
+                $client.EndConnect($connect)
+                return
+            }
+        } catch {
+        } finally {
+            $client.Close()
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Timed out waiting for $Name at $Endpoint"
+}
+
+function Wait-Grep([string]$Pattern, [string]$Path) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Select-String -Path $Path -Pattern $Pattern -Quiet -ErrorAction SilentlyContinue) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not (Select-String -Path $Path -Pattern $Pattern -Quiet -ErrorAction SilentlyContinue)) {
+        throw "Pattern '$Pattern' was not found in $Path"
+    }
+}
+
+function Wait-LogCount([string[]]$Path, [string]$Pattern, [int]$Expected) {
+    for ($attempt = 0; $attempt -lt 300; $attempt++) {
+        $actual = @(Select-String -Path $Path -Pattern $Pattern -SimpleMatch -ErrorAction SilentlyContinue).Count
+        if ($actual -eq $Expected) { return }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Expected $Expected '$Pattern' entries in $($Path -join ', ')."
+}
+
+function Wait-RouteReady([string]$BaseUrl, [string]$TargetRid, [int]$TimeoutSeconds = 30) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $uri = "$BaseUrl/ready?targetRid=$TargetRid"
+    while ([DateTime]::UtcNow -lt $deadline) {
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $uri -TimeoutSec 1
+            if ($response.StatusCode -eq 200) {
+                return
+            }
+        } catch {
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Timed out waiting for API route peer $TargetRid"
+}
+
+function Start-Server([string]$Name, [string]$Binary, [string[]]$Arguments) {
+    $stdout = Join-Path $LogDir "$Name.log"
+    $stderr = Join-Path $LogDir "$Name.err.log"
+    $process = Start-Process -FilePath $Binary -ArgumentList $Arguments -RedirectStandardOutput $stdout -RedirectStandardError $stderr -NoNewWindow -PassThru
+    [void]$process.Handle
+    $script:Processes.Add($process)
+}
+
+function Write-RoleConfig([string]$Name, [string]$ApiNode, [string]$PlayNode) {
+    $configuration = @{
+        sample = @{
+            host = @{ keepRunning = $true }
+            topology = @{
+                logDir = $env:TICTACTOE_LOG_DIR
+                apiNode = $ApiNode
+                playNode = $PlayNode
+                apiEndpoint = $ApiAEndpoint
+                apiAEndpoint = $ApiAEndpoint
+                apiBEndpoint = $ApiBEndpoint
+                apiHttpEndpoint = $ApiAHttpEndpoint
+                apiAHttpEndpoint = $ApiAHttpEndpoint
+                apiBHttpEndpoint = $ApiBHttpEndpoint
+                playEndpoint = $PlayAEndpoint
+                playAEndpoint = $PlayAEndpoint
+                playBEndpoint = $PlayBEndpoint
+                playARouteEndpoint = $PlayARouteEndpoint
+                playBRouteEndpoint = $PlayBRouteEndpoint
+                apiARouteEndpoint = $ApiARouteEndpoint
+                apiBRouteEndpoint = $ApiBRouteEndpoint
+                playASpotEndpoint = $PlayASpotEndpoint
+                playBSpotEndpoint = $PlayBSpotEndpoint
+                playASpotRouterEndpoint = $PlayASpotRouterEndpoint
+                playBSpotRouterEndpoint = $PlayBSpotRouterEndpoint
+                playAStreamEndpoint = $PlayAStreamEndpoint
+                playBStreamEndpoint = $PlayBStreamEndpoint
+                redisEndpoint = $RedisEndpoint
+                redisKeyPrefix = $RedisKeyPrefix
+            }
+        }
+    }
+    $configuration | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $ConfigDir "$Name.json") -Encoding utf8
+}
+
+function Print-Logs() {
+    Get-ChildItem -Path $LogDir -Filter "*.log" -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "===== $($_.FullName) ====="
+        Get-Content -Path $_.FullName -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host $_
+        }
+    }
+}
+
+function Cleanup([int]$Status) {
+    for ($i = $Processes.Count - 1; $i -ge 0; $i--) {
+        $process = $Processes[$i]
+        if ($process.HasExited -and $process.ExitCode -ne 0) {
+            Write-Host "cleanup process $($process.Id) exited unexpectedly with status $($process.ExitCode)"
+            $Status = 1
+            continue
+        }
+        if (-not $process.HasExited) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($process in $Processes) {
+        try {
+            if (-not $process.WaitForExit(1000)) {
+                Write-Host "cleanup process $($process.Id) did not exit after stop"
+                $Status = 1
+            }
+        } catch {
+            Write-Host "cleanup process $($process.Id) wait failed: $($_.Exception.Message)"
+            $Status = 1
+        }
+    }
+    if ($RedisContainer) {
+        Remove-ZlinkSampleRedis $RedisContainer
+    }
+    if ($Status -ne 0) {
+        Print-Logs
+    }
+    Close-ZlinkSampleRunDir -RunDir $LogDir -Status $Status -Label "TicTacToe"
+    return $Status
+}
+
+Invoke-ZlinkSampleFrameworkTests -BuildDir $BuildDir -Configuration $BuildConfiguration `
+    -Regex "test_cpp_framework_sample_parity|zlink_cpp_framework_mesh_node_vertical_test|test_cpp_framework_actor_gateway|sample_smoke_sample_cpp_framework_tictactoe_(play|api)"
+
+$ports = Reserve-Ports 16
+$ApiAEndpoint = "tcp://127.0.0.1:$($ports[0])"
+$ApiBEndpoint = "tcp://127.0.0.1:$($ports[1])"
+$ApiAHttpEndpoint = "http://127.0.0.1:$($ports[2])"
+$ApiBHttpEndpoint = "http://127.0.0.1:$($ports[3])"
+$PlayAEndpoint = "tcp://127.0.0.1:$($ports[4])"
+$PlayBEndpoint = "tcp://127.0.0.1:$($ports[5])"
+$PlayAStreamEndpoint = "tcp://127.0.0.1:$($ports[6])"
+$PlayBStreamEndpoint = "tcp://127.0.0.1:$($ports[7])"
+$PlayASpotEndpoint = "tcp://127.0.0.1:$($ports[8])"
+$PlayBSpotEndpoint = "tcp://127.0.0.1:$($ports[9])"
+$PlayASpotRouterEndpoint = "tcp://127.0.0.1:$($ports[10])"
+$PlayBSpotRouterEndpoint = "tcp://127.0.0.1:$($ports[11])"
+$PlayARouteEndpoint = "tcp://127.0.0.1:$($ports[12])"
+$PlayBRouteEndpoint = "tcp://127.0.0.1:$($ports[13])"
+$ApiARouteEndpoint = "tcp://127.0.0.1:$($ports[14])"
+$ApiBRouteEndpoint = "tcp://127.0.0.1:$($ports[15])"
+$LogDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
+$ConfigDir = Join-Path $LogDir "config"
+New-Item -ItemType Directory -Path $LogDir, $ConfigDir | Out-Null
+$Processes = New-Object System.Collections.Generic.List[System.Diagnostics.Process]
+$RedisContainer = $null
+$RedisKeyPrefix = if ($env:TICTACTOE_CPP_REDIS_KEY_PREFIX) { $env:TICTACTOE_CPP_REDIS_KEY_PREFIX } else { "zlink:tictactoe-cpp:${PID}:$([Guid]::NewGuid().ToString('N')):room:" }
+
+$Status = 1
+try {
+    $redis = Start-ZlinkSampleRedis "zlink-redis-cpp-sample-tictactoe" "redis:7-alpine"
+    $RedisContainer = $redis.ContainerId
+    $RedisEndpoint = $redis.Endpoint
+    Wait-Port "redis" $RedisEndpoint
+
+    Write-RoleConfig "play-a" "a" "a"
+    Write-RoleConfig "play-b" "a" "b"
+    Write-RoleConfig "api-a" "a" "a"
+    Write-RoleConfig "api-b" "b" "a"
+
+    Start-Server "play-b" $PlayBin @("--config=$(Join-Path $ConfigDir 'play-b.json')")
+    Start-Server "play-a" $PlayBin @("--config=$(Join-Path $ConfigDir 'play-a.json')")
+    Wait-Port "play-a-route" $PlayARouteEndpoint
+    Wait-Port "play-a-stream" $PlayAStreamEndpoint
+    Wait-Port "play-b-route" $PlayBRouteEndpoint
+    Wait-Port "play-b-stream" $PlayBStreamEndpoint
+
+    Start-Server "api-a" $ApiBin @("--config=$(Join-Path $ConfigDir 'api-a.json')")
+    Start-Server "api-b" $ApiBin @("--config=$(Join-Path $ConfigDir 'api-b.json')")
+    Wait-Port "api-a-channel" $ApiAEndpoint
+    Wait-Port "api-a-http" $ApiAHttpEndpoint
+    Wait-Port "api-a-route" $ApiARouteEndpoint
+    Wait-Port "api-b-channel" $ApiBEndpoint
+    Wait-Port "api-b-http" $ApiBHttpEndpoint
+    Wait-Port "api-b-route" $ApiBRouteEndpoint
+    Wait-RouteReady $ApiAHttpEndpoint "tictactoe-play-a"
+    Wait-RouteReady $ApiAHttpEndpoint "tictactoe-play-b"
+
+    Wait-LogCount (Join-Path $LogDir "play-a.log") "tictactoe-ready kind=peer-route node=play-a peer=play-b" 1
+    Wait-LogCount (Join-Path $LogDir "play-b.log") "tictactoe-ready kind=peer-route node=play-b peer=play-a" 1
+    Wait-LogCount (Join-Path $LogDir "api-a.log") "tictactoe-ready kind=http node=api-a" 1
+    Wait-LogCount (Join-Path $LogDir "api-b.log") "tictactoe-ready kind=http node=api-b" 1
+    Wait-LogCount (Join-Path $LogDir "api-a.log") "tictactoe-ready kind=spot-route node=api-a mesh=tictactoe" 1
+    Wait-LogCount (Join-Path $LogDir "api-b.log") "tictactoe-ready kind=spot-route node=api-b mesh=tictactoe" 1
+
+    $LifecycleCompletionFile = Join-Path $LogDir "lifecycle-complete"
+    Start-Server "client" $ClientBin @(
+        "--api-http-endpoint", $ApiAHttpEndpoint,
+        "--lifecycle-completion-file", "`"$LifecycleCompletionFile`"")
+    $ClientProcess = $Processes[$Processes.Count - 1]
+
+    $clientLog = Join-Path $LogDir "client.log"
+    $playLogs = Join-Path $LogDir "play-*.log"
+    Wait-LogCount $playLogs "tictactoe-lifecycle actor-bound actor=player-x" 1
+    Wait-LogCount $playLogs "tictactoe-lifecycle leave-completed actor=player-x" 1
+    Wait-LogCount $playLogs "tictactoe-lifecycle leave-completed actor=player-o" 1
+    Wait-LogCount $playLogs "tictactoe-lifecycle actor-destroy-complete actor=player-x" 1
+    Wait-LogCount $playLogs "tictactoe-lifecycle actor-destroy-complete actor=player-o" 1
+    New-Item -ItemType File -Path $LifecycleCompletionFile | Out-Null
+
+    if (-not $ClientProcess.WaitForExit(30000)) {
+        throw "TicTacToe client did not exit after lifecycle completion."
+    }
+    if ($ClientProcess.ExitCode -ne 0) {
+        throw "TicTacToe client exited with status $($ClientProcess.ExitCode)."
+    }
+    Wait-LogCount $clientLog "observer-connected endpoint=$PlayBStreamEndpoint" 1
+    Wait-LogCount $clientLog "observer-subscription=verified subscribed=true" 1
+    Wait-LogCount $clientLog "observer-win-milestone=verified actor=player-x wins=100" 1
+    Wait-LogCount $clientLog "reconnected-game-state=verified actor=player-x room=" 1
+    Wait-LogCount $clientLog "tictactoe=completed" 1
+    Wait-LogCount $playLogs "tictactoe-lifecycle actor-destroy-complete actor=observer" 0
+    if (-not (Select-String -Path (Join-Path $env:TICTACTOE_LOG_DIR "*.log") -Pattern "packet=LeaveGameMsg" -Quiet)) {
+        throw "TicTacToe C++ sample logs did not contain LeaveGameMsg evidence."
+    }
+    if (-not (Select-String -Path (Join-Path $env:TICTACTOE_LOG_DIR "*.log") -Pattern "message flow" -Quiet)) {
+        throw "TicTacToe C++ sample logs did not contain message-flow evidence."
+    }
+    $Status = 0
+} finally {
+    $Status = Cleanup $Status
+}
+
+if ($Status -ne 0) {
+    exit $Status
+}
+# full client/server self-check completed
+Write-Host "tictactoe-placement=completed"

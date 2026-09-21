@@ -1,0 +1,207 @@
+/* SPDX-License-Identifier: FSL-1.1-ALv2 */
+#pragma once
+
+#include "../Shared/Contracts/messages.hpp"
+
+#include <zlink/http_client.hpp>
+
+#include <chrono>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+namespace zlink::samples::shoppingmall
+{
+
+inline void ensure (bool condition, const std::string &message)
+{
+    if (!condition)
+        throw std::runtime_error ("Ensure failed: " + message);
+}
+
+// This CLI scenario completes each HTTP request before advancing its workflow state.
+inline order_state_t get_order (zlink::http_client::client_t &api, const std::string &order_id)
+{
+    return api.post ("/orders/get")
+      .body (get_order_state_req_t{order_id})
+      .submit<get_order_state_res_t> ()
+      .value ()
+      .body.state;
+}
+
+inline order_state_t wait_for_status (zlink::http_client::client_t &api,
+                                      const std::string &order_id,
+                                      const std::string &status)
+{
+    for (int i = 0; i < 80; ++i) {
+        auto state = get_order (api, order_id);
+        if (state.status == status)
+            return state;
+        std::this_thread::sleep_for (std::chrono::milliseconds (100));
+    }
+    throw std::runtime_error ("Timed out waiting for order status " + status);
+}
+
+inline bool is_started_or_confirmed (const order_state_t &state)
+{
+    return state.status == order_status_t::created
+           || state.status == order_status_t::inventory_reserved
+           || state.status == order_status_t::payment_authorized
+           || state.status == order_status_t::confirmed;
+}
+
+inline void emit_produced_order (const std::string &name, const std::string &order_id)
+{
+    std::cout << "shoppingmall-produced name=" << name << " order=" << order_id << std::endl;
+}
+
+class shoppingmall_client_scenario_t
+{
+  public:
+    void run (const std::string &api_a_http_url,
+              const std::string &api_b_http_url,
+              const std::string &resume_order_id,
+              const std::string &projection_continue_order_id,
+              const std::string &projection_rebuild_order_id)
+    {
+        auto api_a = zlink::http_client::client_t::create (api_a_http_url)
+                       .timeout (std::chrono::milliseconds (5000))
+                       .build ();
+        auto api_b = zlink::http_client::client_t::create (api_b_http_url)
+                       .timeout (std::chrono::milliseconds (5000))
+                       .build ();
+
+        const auto success_req =
+          start_order_req_t{"cart-success", "addr-home", "pm-ok", "order-success-001"};
+        auto success = api_a.post ("/orders/start")
+                         .body (success_req)
+                         .submit<start_order_res_t> ()
+                         .value ()
+                         .body;
+        /* 공통 sample spec §15: 새 주문의 StartOrderRes는 `Created`만 담고 즉시 돌아온다. 종료는
+     * GetOrderStateReq 폴링으로 확인한다. */
+        ensure (success.state.status == order_status_t::created, "new order responds Created");
+        emit_produced_order ("success", success.order_id);
+        auto created = get_order (api_a, success.order_id);
+        ensure (is_started_or_confirmed (created), "successful order was created");
+        ensure (created.shipping_address_id.value_or ("") == success_req.shipping_address_id,
+                "shipping address");
+        auto confirmed = wait_for_status (api_a, success.order_id, order_status_t::confirmed);
+        ensure (confirmed.reservation_id.has_value (), "reservation id");
+        ensure (confirmed.payment_id.has_value (), "payment id");
+        ensure (confirmed.amount == decimal_t ("120.00"), "amount");
+        ensure (confirmed.currency.value_or ("") == "USD", "currency");
+
+        auto duplicate = api_b.post ("/orders/start")
+                           .body (success_req)
+                           .submit<start_order_res_t> ()
+                           .value ()
+                           .body;
+        ensure (duplicate.order_id == success.order_id, "duplicate idempotency");
+
+        const auto concurrent_req =
+          start_order_req_t{"cart-success", "addr-office", "pm-ok", "order-concurrent-001"};
+        auto concurrent_a = api_a.post ("/orders/start")
+                              .body (concurrent_req)
+                              .submit<start_order_res_t> ()
+                              .value ()
+                              .body;
+        auto concurrent_b = api_b.post ("/orders/start")
+                              .body (concurrent_req)
+                              .submit<start_order_res_t> ()
+                              .value ()
+                              .body;
+        ensure (concurrent_a.order_id == concurrent_b.order_id, "concurrent idempotency");
+        emit_produced_order ("concurrent", concurrent_a.order_id);
+        auto concurrent_confirmed =
+          wait_for_status (api_a, concurrent_a.order_id, order_status_t::confirmed);
+        ensure (concurrent_confirmed.status == order_status_t::confirmed, "concurrent confirmed");
+
+        const auto pending_req =
+          start_order_req_t{"cart-success", "addr-office", "pm-ok", "order-pending-001"};
+        auto pending = api_b.post ("/orders/start")
+                         .body (pending_req)
+                         .submit<start_order_res_t> ()
+                         .value ()
+                         .body;
+        emit_produced_order ("pending", pending.order_id);
+        ensure (pending.state.status == order_status_t::created, "pending recovered as Created");
+        auto pending_confirmed =
+          wait_for_status (api_a, pending.order_id, order_status_t::confirmed);
+        ensure (pending_confirmed.status == order_status_t::confirmed, "pending confirmed");
+
+        auto resumed =
+          api_b.post ("/orders/continue")
+            .body (continue_order_workflow_req_t{resume_order_id, "continue:" + resume_order_id})
+            .submit<continue_order_workflow_res_t> ()
+            .value ()
+            .body;
+        ensure (resumed.state.status == order_status_t::confirmed, "resumed confirmed");
+        ensure (resumed.state.reservation_id.value_or ("") == "reservation-" + resume_order_id,
+                "resumed reservation");
+        ensure (resumed.state.payment_id.value_or ("") == "payment-" + resume_order_id,
+                "resumed payment");
+
+        const auto inventory_req =
+          start_order_req_t{"cart-inventory-fail", "addr-home", "pm-ok", "order-inventory-001"};
+        auto inventory_started = api_a.post ("/orders/start")
+                                   .body (inventory_req)
+                                   .submit<start_order_res_t> ()
+                                   .value ()
+                                   .body;
+        emit_produced_order ("inventory-failure", inventory_started.order_id);
+        auto inventory_failed =
+          wait_for_status (api_a, inventory_started.order_id, order_status_t::failed);
+        ensure (inventory_failed.reason.value_or ("").find ("inventory") != std::string::npos,
+                "inventory failure");
+
+        const auto payment_req =
+          start_order_req_t{"cart-success", "addr-home", "pm-decline", "order-payment-001"};
+        auto payment_started = api_b.post ("/orders/start")
+                                 .body (payment_req)
+                                 .submit<start_order_res_t> ()
+                                 .value ()
+                                 .body;
+        emit_produced_order ("payment-failure", payment_started.order_id);
+        auto payment_failed =
+          wait_for_status (api_b, payment_started.order_id, order_status_t::failed);
+        ensure (payment_failed.reservation_id.has_value (), "payment failure reservation");
+        ensure (payment_failed.reason.value_or ("").find ("payment") != std::string::npos,
+                "payment failure");
+
+        auto healed = api_b.post ("/orders/continue")
+                        .body (continue_order_workflow_req_t{
+                          projection_continue_order_id, "continue:" + projection_continue_order_id})
+                        .submit<continue_order_workflow_res_t> ()
+                        .value ()
+                        .body;
+        ensure (healed.state.status == order_status_t::confirmed, "healed projection");
+        auto healed_read = get_order (api_a, projection_continue_order_id);
+        ensure (healed_read.status == order_status_t::confirmed, "healed read");
+        auto rebuilt = api_a.post ("/orders/rebuild")
+                         .body (rebuild_order_projection_req_t{
+                           projection_rebuild_order_id, "rebuild:" + projection_rebuild_order_id})
+                         .submit<rebuild_order_projection_res_t> ()
+                         .value ()
+                         .body;
+        ensure (rebuilt.state.status == order_status_t::confirmed, "rebuilt projection");
+        auto rebuilt_read = get_order (api_b, projection_rebuild_order_id);
+        ensure (rebuilt_read.status == order_status_t::confirmed, "rebuilt read");
+
+        auto delayed_first = get_order (api_b, payment_started.order_id);
+        auto delayed_second = get_order (api_a, payment_started.order_id);
+        ensure (delayed_first.status == delayed_second.status, "delayed read consistency");
+        ensure (delayed_second.status == order_status_t::failed, "delayed read failed");
+
+        const auto scale_req =
+          start_order_req_t{"cart-success", "addr-office", "pm-ok", "order-scale-001"};
+        auto scale =
+          api_b.post ("/orders/start").body (scale_req).submit<start_order_res_t> ().value ().body;
+        emit_produced_order ("scale-out", scale.order_id);
+        auto scale_confirmed = wait_for_status (api_a, scale.order_id, order_status_t::confirmed);
+        ensure (scale_confirmed.status == order_status_t::confirmed, "scale confirmed");
+    }
+};
+
+} // namespace zlink::samples::shoppingmall

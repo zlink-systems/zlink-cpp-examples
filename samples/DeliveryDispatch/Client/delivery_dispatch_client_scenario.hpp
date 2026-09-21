@@ -1,0 +1,334 @@
+/* SPDX-License-Identifier: FSL-1.1-ALv2 */
+#pragma once
+
+#include "../Shared/Contracts/messages.hpp"
+
+#include <zlink/framework/codecs/json_stream_connector.hpp>
+#include <zlink/http_client.hpp>
+#include <zlink/stream_connector.hpp>
+#include <zlink/stream_e2e_client.hpp>
+#include <zlink/stream_e2e_client/codecs/auto_codec.hpp>
+
+#include <chrono>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace zlink::samples::deliverydispatch
+{
+
+// This CLI scenario completes each HTTP request before advancing its workflow state.
+class delivery_dispatch_client_scenario_t
+{
+    using delivery_status_message_t = zlink::stream_connector::message_t<delivery_status_notify_t>;
+    using offer_delivery_message_t = zlink::stream_connector::message_t<offer_delivery_notify_t>;
+
+  public:
+    bool run (const std::string &api_http_url,
+              const std::string &customer_stream_endpoint,
+              const std::string &courier_stream_endpoint)
+    {
+        try {
+            zlink::stream_connector::connector_options_t connector_options;
+            connector_options.endpoint = customer_stream_endpoint;
+            connector_options.connect_timeout = std::chrono::seconds (5);
+            connector_options.request_timeout = std::chrono::seconds (12);
+            connector_options.dispatch_mode = zlink::stream_connector::dispatch_mode_t::immediate;
+            auto core_customer =
+              zlink::stream_connector::connector_factory_t::create (connector_options);
+            use_json_codec (core_customer);
+            auto customer = zlink::stream_e2e_client::use (core_customer);
+            auto customer_connected = customer.connect ().submit ();
+            ensure (static_cast<bool> (customer_connected), "customer stream connect failed");
+
+            connector_options.endpoint = courier_stream_endpoint;
+            auto core_courier_a =
+              zlink::stream_connector::connector_factory_t::create (connector_options);
+            use_json_codec (core_courier_a);
+            auto courier_a = zlink::stream_e2e_client::use (core_courier_a);
+            auto courier_a_connected = courier_a.connect ().submit ();
+            ensure (static_cast<bool> (courier_a_connected), "courier-a stream connect failed");
+
+            auto core_courier_b =
+              zlink::stream_connector::connector_factory_t::create (connector_options);
+            use_json_codec (core_courier_b);
+            auto courier_b = zlink::stream_e2e_client::use (core_courier_b);
+            auto courier_b_connected = courier_b.connect ().submit ();
+            ensure (static_cast<bool> (courier_b_connected), "courier-b stream connect failed");
+
+            bind_courier (courier_a, "courier-a");
+            bind_courier (courier_b, "courier-b");
+
+            auto http = zlink::http_client::client_t::create (api_http_url)
+                          .timeout (std::chrono::seconds (12))
+                          .build ();
+            run_successful_delivery (http, customer, courier_a);
+            run_reassigned_delivery (http, customer, courier_a, courier_b);
+            run_candidates_exhausted_delivery (http, customer, courier_a, courier_b);
+            assert_server_evidence (http);
+            return true;
+        }
+        catch (const std::exception &error) {
+            const std::string line =
+              std::format ("deliverydispatch scenario failed: {}\n", error.what ());
+            std::cerr << line;
+            return false;
+        }
+    }
+
+  private:
+    using connector_t = zlink::stream_e2e_client::coroutine_connector_t;
+
+    static void use_json_codec (zlink::stream_connector::connector_t &connector)
+    {
+        connector.codecs ()
+          .enable_codec (zlink::stream_connector::codec_t::json)
+          .use_default_codec (zlink::stream_connector::codec_t::json);
+    }
+
+    /* Actor placement는 Location Store가 결정한다. Scenario는 global CourierId와 bind 성공만
+     * 검증하며 current owner NodeRid를 성공 조건으로 사용하지 않는다. */
+    static void bind_courier (connector_t &courier, const std::string &courier_id)
+    {
+        const auto bound = courier.request (bind_courier_session_req_t{courier_id})
+                             .async<bind_courier_session_res_t> ()
+                             .result ();
+        if (!bound) {
+            throw std::runtime_error (bound.error () ? bound.error ()->message
+                                                     : "courier bind failed");
+        }
+        ensure (bound.value ().courier_id == courier_id, "courier bind id mismatch");
+    }
+
+    static void run_successful_delivery (zlink::http_client::client_t &http,
+                                         connector_t &customer,
+                                         connector_t &courier)
+    {
+        const std::string delivery_id = "delivery-success";
+        const auto subscribed = customer.request (subscribe_delivery_req_t{delivery_id})
+                                  .async<subscribe_delivery_res_t> ()
+                                  .result ();
+        if (!subscribed) {
+            throw std::runtime_error (subscribed.error () ? subscribed.error ()->message
+                                                          : "delivery-success subscription failed");
+        }
+        ensure (subscribed && subscribed.value ().delivery_id == delivery_id,
+                "delivery-success subscription failed");
+        auto offer = wait_offer (courier, delivery_id, "courier-a");
+        auto statuses = customer.wait_for_sequence<delivery_status_notify_t> ()
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::assigned;
+                          })
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::accepted;
+                          })
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::picked_up;
+                          })
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::delivered;
+                          })
+                          .timeout (std::chrono::seconds (12))
+                          .async ();
+
+        auto created_future = std::async (std::launch::async, [&http, delivery_id] {
+            return http.post ("/deliveries")
+              .body (
+                create_delivery_req_t{delivery_id, "customer-1", "Kitchen 12", "Customer Lobby"})
+              .submit<create_delivery_res_t> ()
+              .value ()
+              .body;
+        });
+        const auto courier_offer = offer.get ().payload;
+        send_decision (courier, courier_offer.delivery_id, courier_offer.courier_id, true);
+        auto created = created_future.get ();
+        ensure (created.delivery_id == delivery_id, "delivery-success create failed");
+        auto received = statuses.result ();
+        ensure (static_cast<bool> (received), "delivery-success status sequence failed");
+        ensure (received.value ()[0].payload.courier_id == "courier-a",
+                "assigned courier mismatch");
+        ensure (received.value ()[1].payload.courier_id == "courier-a",
+                "accepted courier mismatch");
+        ensure (received.value ()[2].payload.courier_id == "courier-a",
+                "picked-up courier mismatch");
+        ensure (received.value ()[3].payload.courier_id == "courier-a",
+                "delivered courier mismatch");
+    }
+
+    static void run_reassigned_delivery (zlink::http_client::client_t &http,
+                                         connector_t &customer,
+                                         connector_t &courier_a,
+                                         connector_t &courier_b)
+    {
+        const std::string delivery_id = "delivery-reassign";
+        const auto subscribed = customer.request (subscribe_delivery_req_t{delivery_id})
+                                  .async<subscribe_delivery_res_t> ()
+                                  .result ();
+        if (!subscribed) {
+            throw std::runtime_error (subscribed.error ()
+                                        ? subscribed.error ()->message
+                                        : "delivery-reassign subscription failed");
+        }
+        ensure (subscribed && subscribed.value ().delivery_id == delivery_id,
+                "delivery-reassign subscription failed");
+        auto first_offer = wait_offer (courier_a, delivery_id, "courier-a");
+        auto second_offer = wait_offer (courier_b, delivery_id, "courier-b");
+        auto statuses = customer.wait_for_sequence<delivery_status_notify_t> ()
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::assigned;
+                          })
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::reassigned;
+                          })
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::accepted;
+                          })
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::delivered;
+                          })
+                          .timeout (std::chrono::seconds (12))
+                          .async ();
+
+        auto created_future = std::async (std::launch::async, [&http, delivery_id] {
+            return http.post ("/deliveries")
+              .body (
+                create_delivery_req_t{delivery_id, "customer-1", "Kitchen 12", "Customer Lobby"})
+              .submit<create_delivery_res_t> ()
+              .value ()
+              .body;
+        });
+        (void) first_offer.get ();
+        const auto accepted_offer = second_offer.get ().payload;
+        send_decision (courier_b, accepted_offer.delivery_id, accepted_offer.courier_id, true);
+        auto created = created_future.get ();
+        ensure (created.delivery_id == delivery_id, "delivery-reassign create failed");
+        auto received = statuses.result ();
+        ensure (static_cast<bool> (received), "delivery-reassign status sequence failed");
+        ensure (received.value ()[0].payload.courier_id == "courier-a",
+                "assigned courier mismatch");
+        ensure (received.value ()[1].payload.courier_id == "courier-b",
+                "reassigned courier mismatch");
+        ensure (received.value ()[2].payload.courier_id == "courier-b",
+                "accepted courier mismatch");
+        ensure (received.value ()[3].payload.courier_id == "courier-b",
+                "delivered courier mismatch");
+        /* This decision belongs to A's expired offer.  Send it only after B's
+         * acceptance path has completed so the dispatch worker must reject it
+         * as stale rather than treating it as the active attempt. */
+        send_decision (courier_a, delivery_id, "courier-a", true);
+        std::cout << "deliverydispatch-reassignment=completed\n";
+    }
+
+    static void run_candidates_exhausted_delivery (zlink::http_client::client_t &http,
+                                                   connector_t &customer,
+                                                   connector_t &courier_a,
+                                                   connector_t &courier_b)
+    {
+        const std::string delivery_id = "delivery-exhausted";
+        const auto subscribed = customer.request (subscribe_delivery_req_t{delivery_id})
+                                  .async<subscribe_delivery_res_t> ()
+                                  .result ();
+        if (!subscribed) {
+            throw std::runtime_error (subscribed.error ()
+                                        ? subscribed.error ()->message
+                                        : "delivery-exhausted subscription failed");
+        }
+        ensure (subscribed.value ().delivery_id == delivery_id,
+                "delivery-exhausted subscription id mismatch");
+        auto first_offer = wait_offer (courier_a, delivery_id, "courier-a");
+        auto second_offer = wait_offer (courier_b, delivery_id, "courier-b");
+        auto statuses = customer.wait_for_sequence<delivery_status_notify_t> ()
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::assigned;
+                          })
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::reassigned;
+                          })
+                          .expect ([delivery_id] (const delivery_status_message_t &message) {
+                              const auto &payload = message.payload;
+                              return payload.delivery_id == delivery_id
+                                     && payload.status == delivery_status_t::failed;
+                          })
+                          .timeout (std::chrono::seconds (12))
+                          .async ();
+        auto created_future = std::async (std::launch::async, [&http, delivery_id] {
+            return http.post ("/deliveries")
+              .body (
+                create_delivery_req_t{delivery_id, "customer-1", "Kitchen 12", "Customer Lobby"})
+              .submit<create_delivery_res_t> ()
+              .value ()
+              .body;
+        });
+        const auto rejected_a = first_offer.get ().payload;
+        send_decision (courier_a, rejected_a.delivery_id, rejected_a.courier_id, false);
+        const auto rejected_b = second_offer.get ().payload;
+        send_decision (courier_b, rejected_b.delivery_id, rejected_b.courier_id, false);
+        const auto created = created_future.get ();
+        ensure (created.delivery_id == delivery_id, "delivery-exhausted create failed");
+        const auto received = statuses.result ();
+        ensure (static_cast<bool> (received), "delivery-exhausted status sequence failed");
+        ensure (received.value ()[2].payload.status == delivery_status_t::failed,
+                "delivery-exhausted did not reach failed");
+    }
+
+    static void assert_server_evidence (zlink::http_client::client_t &http)
+    {
+        auto assertion = http.post ("/self-check/assert")
+                           .body (server_assertion_req_t{"delivery-success", "delivery-reassign"})
+                           .submit<server_assertion_res_t> ()
+                           .value ()
+                           .body;
+        ensure (assertion.passed, "server evidence assertion failed");
+        std::cout << "deliverydispatch-server-evidence=completed\n";
+    }
+
+    static std::future<zlink::stream_connector::message_t<offer_delivery_notify_t>>
+    wait_offer (connector_t &courier, const std::string &delivery_id, const std::string &courier_id)
+    {
+        return courier.wait_for<offer_delivery_notify_t> ()
+          .where ([delivery_id, courier_id] (const offer_delivery_message_t &message) {
+              const auto &payload = message.payload;
+              return payload.delivery_id == delivery_id && payload.courier_id == courier_id;
+          })
+          .timeout (std::chrono::seconds (12))
+          .to_future ("courier offer wait failed");
+    }
+
+    static void send_decision (connector_t &courier,
+                               const std::string &delivery_id,
+                               const std::string &courier_id,
+                               bool accepted)
+    {
+        courier.send (courier_decision_msg_t{delivery_id, courier_id, accepted, ""}).submit ();
+    }
+
+    static void ensure (bool condition, const char *message)
+    {
+        if (!condition) {
+            throw std::runtime_error (message);
+        }
+    }
+};
+
+} // namespace zlink::samples::deliverydispatch

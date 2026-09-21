@@ -1,0 +1,345 @@
+/* SPDX-License-Identifier: FSL-1.1-ALv2 */
+#pragma once
+
+#include <zlink/framework.hpp>
+
+#include "Configuration/sample_names.hpp"
+#include "../Shared/Contracts/messages.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace zlink::samples::tictactoe
+{
+
+using namespace framework;
+
+class stop_after_start_service_t final : public hosted_service_t
+{
+  public:
+    explicit stop_after_start_service_t (app_t &app) : _app (app) {}
+
+    task_t<void> start (service_provider_t &) override
+    {
+        started = true;
+        _app.stop ();
+        co_return;
+    }
+
+    void stop () noexcept override { stopped = true; }
+
+    bool started = false;
+    bool stopped = false;
+
+  private:
+    app_t &_app;
+};
+
+class play_route_readiness_service_t final : public hosted_service_t
+{
+  private:
+    struct state_t
+    {
+        std::atomic_bool reported{false};
+        std::atomic_bool stopping{false};
+    };
+
+  public:
+    play_route_readiness_service_t (std::string mesh_name,
+                                    std::string node_name,
+                                    std::string expected_peer) :
+        _mesh_name (std::move (mesh_name)),
+        _node_name (std::move (node_name)),
+        _expected_peer (std::move (expected_peer))
+    {
+    }
+
+    task_t<void> start (service_provider_t &services) override
+    {
+        auto state = std::make_shared<state_t> ();
+        _state = state;
+        auto &runtime = services.get_required<route_mesh_runtime_t> ();
+        _observation =
+          runtime.observe (_mesh_name,
+                           64,
+                           [state, node_name = _node_name, expected_peer = _expected_peer] (
+                             const observed_status_t<mesh_node_snapshot_t> &observed) {
+                               report_if_ready (state, node_name, expected_peer, observed.status);
+                           });
+        /* The peer can become ready while the observation registration is being
+         * installed. Poll the same public snapshot until the marker is reported,
+         * so startup readiness does not depend on an event edge being retained. */
+        _worker = std::thread ([state,
+                                runtime = &runtime,
+                                mesh_name = _mesh_name,
+                                node_name = _node_name,
+                                expected_peer = _expected_peer] () mutable {
+            while (!state->stopping.load (std::memory_order_acquire)) {
+                try {
+                    report_if_ready (
+                      state, node_name, expected_peer, runtime->snapshot (mesh_name));
+                }
+                catch (...) {
+                }
+                if (state->reported.load (std::memory_order_acquire))
+                    return;
+                std::this_thread::sleep_for (std::chrono::milliseconds (50));
+            }
+        });
+        co_return;
+    }
+
+    void request_stop () noexcept override
+    {
+        if (_state)
+            _state->stopping.store (true, std::memory_order_release);
+        if (_observation)
+            _observation->close ();
+    }
+
+    void stop () noexcept override
+    {
+        request_stop ();
+        if (_worker.joinable ())
+            _worker.join ();
+        _observation.reset ();
+        _state.reset ();
+    }
+
+  private:
+    static void report_if_ready (const std::shared_ptr<state_t> &state,
+                                 const std::string &node_name,
+                                 const std::string &expected_peer,
+                                 const mesh_node_snapshot_t &snapshot)
+    {
+        const auto peer_ready = std::any_of (snapshot.peers.begin (),
+                                             snapshot.peers.end (),
+                                             [&expected_peer] (const mesh_peer_snapshot_t &peer) {
+                                                 return peer.node_rid.to_string () == expected_peer
+                                                        && peer.state == peer_state_t::ready;
+                                             });
+        if (!peer_ready || state->reported.exchange (true, std::memory_order_acq_rel))
+            return;
+        constexpr std::string_view routing_prefix{"tictactoe-"};
+        const auto peer_name = expected_peer.starts_with (routing_prefix)
+                                 ? expected_peer.substr (routing_prefix.size ())
+                                 : expected_peer;
+        std::cout << "tictactoe-ready kind=peer-route node=" << node_name << " peer=" << peer_name
+                  << std::endl;
+    }
+
+    std::string _mesh_name;
+    std::string _node_name;
+    std::string _expected_peer;
+    std::shared_ptr<state_t> _state;
+    std::unique_ptr<mesh_runtime_observation_t> _observation;
+    std::thread _worker;
+};
+
+class play_api_channel_readiness_service_t final : public hosted_service_t
+{
+  public:
+    explicit play_api_channel_readiness_service_t (std::string node_name) :
+        _node_name (std::move (node_name))
+    {
+    }
+
+    task_t<void> start (service_provider_t &services) override
+    {
+        auto state = std::make_shared<state_t> ();
+        _state = state;
+        state->client =
+          std::make_shared<channel_client_t> (services.get_required<channel_client_t> ());
+        _worker = std::thread ([state, node_name = _node_name] () mutable {
+            while (!state->stopping.load (std::memory_order_acquire)) {
+                struct attempt_t
+                {
+                    std::condition_variable ready;
+                    std::mutex mutex;
+                    bool completed = false;
+                    bool accepted = false;
+                };
+                auto attempt = std::make_shared<attempt_t> ();
+                auto request = state->client
+                                 ->request (sample_names_t::api_channel,
+                                            authenticate_player_req_t{"tictactoe-readiness"})
+                                 .timeout (std::chrono::milliseconds (500))
+                                 .async<authenticate_player_res_t> ();
+                observe_task_completion (
+                  request, [attempt] (const result_t<authenticate_player_res_t> &result) {
+                      {
+                          std::lock_guard lock (attempt->mutex);
+                          attempt->accepted = result && !result.value ().player.actor_id.empty ();
+                          attempt->completed = true;
+                      }
+                      attempt->ready.notify_one ();
+                  });
+                std::unique_lock lock (attempt->mutex);
+                attempt->ready.wait_for (
+                  lock, std::chrono::milliseconds (500), [&attempt] { return attempt->completed; });
+                if (!attempt->accepted)
+                    continue;
+                if (!state->reported.exchange (true, std::memory_order_acq_rel)) {
+                    std::cout << "tictactoe play api channel ready node=" << node_name << std::endl;
+                }
+                return;
+            }
+        });
+        co_return;
+    }
+
+    void request_stop () noexcept override
+    {
+        if (_state)
+            _state->stopping.store (true, std::memory_order_release);
+    }
+
+    void stop () noexcept override
+    {
+        request_stop ();
+        if (_worker.joinable ())
+            _worker.join ();
+        _state.reset ();
+    }
+
+  private:
+    struct state_t
+    {
+        std::atomic_bool stopping{false};
+        std::atomic_bool reported{false};
+        std::shared_ptr<channel_client_t> client;
+    };
+
+    std::string _node_name;
+    std::shared_ptr<state_t> _state;
+    std::thread _worker;
+};
+
+class api_http_readiness_service_t final : public hosted_service_t
+{
+  public:
+    explicit api_http_readiness_service_t (std::string node_name) :
+        _node_name (std::move (node_name))
+    {
+    }
+
+    task_t<void> start (service_provider_t &) override
+    {
+        std::cout << "tictactoe-ready kind=http node=" << _node_name << std::endl;
+        co_return;
+    }
+
+    void stop () noexcept override {}
+
+  private:
+    std::string _node_name;
+};
+
+class api_spot_route_readiness_service_t final : public hosted_service_t
+{
+  private:
+    struct state_t
+    {
+        std::atomic_bool reported{false};
+        std::atomic_bool stopping{false};
+    };
+
+  public:
+    api_spot_route_readiness_service_t (std::string mesh_name,
+                                        std::string node_name,
+                                        std::vector<std::string> target_rids) :
+        _mesh_name (std::move (mesh_name)),
+        _node_name (std::move (node_name)),
+        _target_rids (std::move (target_rids))
+    {
+    }
+
+    task_t<void> start (service_provider_t &services) override
+    {
+        auto state = std::make_shared<state_t> ();
+        _state = state;
+        auto &runtime = services.get_required<route_mesh_runtime_t> ();
+        _observation = runtime.observe (
+          _mesh_name,
+          64,
+          [state, node_name = _node_name, mesh_name = _mesh_name, target_rids = _target_rids] (
+            const observed_status_t<mesh_node_snapshot_t> &observed) {
+              report_if_ready (state, node_name, mesh_name, target_rids, observed.status);
+          });
+        /* The mesh can become ready while the observation is being installed. */
+        _worker = std::thread ([state,
+                                runtime = &runtime,
+                                mesh_name = _mesh_name,
+                                node_name = _node_name,
+                                target_rids = _target_rids] () mutable {
+            while (!state->stopping.load (std::memory_order_acquire)) {
+                try {
+                    report_if_ready (
+                      state, node_name, mesh_name, target_rids, runtime->snapshot (mesh_name));
+                }
+                catch (...) {
+                }
+                if (state->reported.load (std::memory_order_acquire))
+                    return;
+                std::this_thread::sleep_for (std::chrono::milliseconds (50));
+            }
+        });
+        co_return;
+    }
+
+    void request_stop () noexcept override
+    {
+        if (_state)
+            _state->stopping.store (true, std::memory_order_release);
+        if (_observation)
+            _observation->close ();
+    }
+
+    void stop () noexcept override
+    {
+        request_stop ();
+        if (_worker.joinable ())
+            _worker.join ();
+        _observation.reset ();
+        _state.reset ();
+    }
+
+  private:
+    static void report_if_ready (const std::shared_ptr<state_t> &state,
+                                 const std::string &node_name,
+                                 const std::string &mesh_name,
+                                 const std::vector<std::string> &target_rids,
+                                 const mesh_node_snapshot_t &snapshot)
+    {
+        const auto targets_ready =
+          std::ranges::all_of (target_rids, [&snapshot] (const std::string &target_rid) {
+              return std::ranges::any_of (snapshot.peers,
+                                          [&target_rid] (const mesh_peer_snapshot_t &peer) {
+                                              return peer.node_rid.to_string () == target_rid
+                                                     && peer.state == peer_state_t::ready;
+                                          });
+          });
+        if (!targets_ready || state->reported.exchange (true, std::memory_order_acq_rel))
+            return;
+        std::cout << "tictactoe-ready kind=spot-route node=" << node_name << " mesh=" << mesh_name
+                  << std::endl;
+    }
+
+    std::string _mesh_name;
+    std::string _node_name;
+    std::vector<std::string> _target_rids;
+    std::shared_ptr<state_t> _state;
+    std::unique_ptr<mesh_runtime_observation_t> _observation;
+    std::thread _worker;
+};
+
+} // namespace zlink::samples::tictactoe
