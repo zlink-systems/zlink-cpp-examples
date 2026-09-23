@@ -1,7 +1,7 @@
 # DeliveryDispatch C++ 샘플
 
 DeliveryDispatch 샘플은 배달 생성, courier 배정, 픽업, 완료까지의 상태 전이를 C++ framework로 검증한다.
-구조와 호출 순서는 공통 [DeliveryDispatch sample](../../../../doc/framework/common/sample/deliverydispatch/README.ko.md)을
+구조와 호출 순서는 공통 [DeliveryDispatch sample](https://github.com/zlink-systems/zlink/blob/main/framework/doc/framework/common/sample/deliverydispatch/README.ko.md)을
 따른다. Client는 HTTP API로 배달을 생성하고 stream connector로 고객 세션과 배송원 세션을 연 뒤
 상태 알림과 배송 제안을 기다린다.
 

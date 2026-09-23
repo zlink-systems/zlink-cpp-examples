@@ -116,12 +116,6 @@ class customer_entry_spot_t : public entry_spot_t<customer_actor_t>
             delivery_status_updated_msg_t::packet_name);
     }
 
-    task_t<spot_actor_join_result_t> on_actor_join (std::string_view,
-                                                    const zlink::framework::message_t &) override
-    {
-        co_return spot_actor_join_result_t::accept ();
-    }
-
     task_t<void> on_actor_joined (customer_actor_t &) override { co_return; }
     task_t<void> on_leave_actor (customer_actor_t &) override { co_return; }
 
@@ -146,11 +140,13 @@ class customer_entry_spot_t : public entry_spot_t<customer_actor_t>
             std::cerr << ignored_line;
             return;
         }
+        // --8<-- [start:doc-dd-bound-session-push]
         actor.context ()
           .bound_session ()
           .send (delivery_status_notify_t{
             status.delivery_id, status.status, status.courier_id, status.occurred_at_unix_ms})
           .async ();
+        // --8<-- [end:doc-dd-bound-session-push]
         if (status.status == delivery_status_t::delivered) {
             const std::string delivered_line = std::format (
               "deliverydispatch-customer pushed status=Delivered delivery={}\n",
