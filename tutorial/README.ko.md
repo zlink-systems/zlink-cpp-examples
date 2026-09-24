@@ -239,10 +239,24 @@ IDE가 같은 `build/`를 이어서 쓴다. 이 파일은 bootstrap이 매번 �
 | `error LNK2038: mismatch detected for 'RuntimeLibrary'` | 푼 prefix 또는 build tree가 선택한 toolchain과 맞지 않는다. `.zlink/`와 `build`를 지우고 bootstrap부터 다시 한다 |
 | Windows에서 실행 파일이 아무 출력 없이 즉시 끝난다 (종료 코드 `-1073741515`, `STATUS_DLL_NOT_FOUND`) | `zlink.dll`이 실행 파일 옆에 없다. `cmake --build build --config Release`를 다시 실행하면 post-build 단계가 `build\Release\`에 복사한다 |
 | `docker: error during connect` / `Cannot connect to the Docker daemon` | Docker Desktop이 실행 중이 아니다. 시작한 뒤 `docker run ...`을 다시 실행한다 |
-| `docker: Error response from daemon: ... port is already allocated` / `Bind for 127.0.0.1:6379 failed` | 6379를 다른 Redis가 쓰고 있다. 그 Redis를 그대로 써도 된다 — tutorial은 `127.0.0.1:6379`만 본다 |
+| `docker: Error response from daemon: ... port is already allocated` / `Bind for 127.0.0.1:6379 failed` | 6379를 다른 Redis가 쓰고 있다. 아래와 같이 이 tutorial의 키를 삭제한 뒤 사용하거나, 6379에서 새 Redis를 실행한다 |
 | Server 로그에 `Location Store` 연결 실패 | Redis가 없다. Channel 단계까지는 그대로 돌지만 Spot·Actor·Location 단계는 실패한다 |
+| 강제 종료 후 Server가 시작하지 못한다 | 이전 owner lease는 최대 15초 동안 유효할 수 있다([owner lease TTL 기본값](https://github.com/zlink-systems/zlink/blob/main/framework/doc/framework/common/spec/server/05-location-relocation/01-location-runtime.ko.md#L670-L674)). 만료될 때까지 기다린 뒤 Server를 다시 실행한다. 시작에 실패한 process는 자동으로 재시도하지 않는다. 즉시 다시 시작하려면 이전 tutorial process를 종료하고 아래 명령으로 이 tutorial의 키를 삭제한다 |
 | `bind: Address already in use` / `Only one usage of each socket address` | 위 표의 port를 다른 process가 사용 중이다. 이전 실행의 `tutorial_server`·`tutorial_client`가 아직 실행 중인지 확인한다 |
 | `curl: (7) Failed to connect to 127.0.0.1 port 5180` | Client가 아직 뜨지 않았거나 죽었다. Client의 stderr를 본다 |
+
+기존 Redis를 사용하려면 이전에 실행한 이 tutorial의 process를 먼저 종료하고 Location Store와
+Relocation Store의 기록을 삭제한다. 사용하는 셸에서 다음 명령을 실행한 뒤 [실행](#실행) 블록에서
+`docker run` 행만 생략한다. 이 명령은 이 tutorial의 `zlink-tutorial-cpp:` 접두사에 속한 키만
+삭제하며, 6379의 Redis에 연결된 `redis-cli`가 필요하다.
+
+```bash title="linux"
+redis-cli --scan --pattern 'zlink-tutorial-cpp:*' | while IFS= read -r key; do redis-cli DEL "$key" >/dev/null; done
+```
+
+```powershell title="windows"
+redis-cli --scan --pattern 'zlink-tutorial-cpp:*' | ForEach-Object { redis-cli DEL $_ | Out-Null }
+```
 
 ## 프로젝트 구성
 
@@ -799,7 +813,6 @@ Spot 단계가 더한 마커는 아래와 같다.
 | fanout handler 등록 | `AddFanoutChannel(...).AddHandler<...>()` | handler group을 거친다. channel builder에 handler를 직접 다는 API가 없다 |
 | ClientServer 호출자 | `IZLinkRouteClient`가 mesh channel과 ClientServer channel을 함께 다룬다 | 타입이 나뉜다. mesh는 `route_client_t`, ClientServer는 `channel_client_t` |
 | fanout publish의 topic | `Publish("broadcast", notice)` — topic을 적지 않는다 | `publish("broadcast", topic, notice)` — topic을 적는다. 구독자 handler가 듣는 topic의 기본값이 event 타입의 packet 이름이므로 그 값을 적는다 |
-| mesh advertise host | `Listen("tcp://0.0.0.0:7201")`만으로 동작한다 | wildcard bind에는 `set_advertise_host`가 필요하다. fanout publisher도 마찬가지여서 `tcp://127.0.0.1:7412`로 bind한다. wildcard로 두면 startup에서 `Fanout wildcard bind host requires an advertise host`로 죽는다 |
 | `NodeStatus`의 `ProcessId` | 있다 | 없다. process id를 얻는 표준 C++ API가 없어 뺐다 |
 | `NodeStatus`의 `Uptime` 기준 | `Process.StartTime` | 정적 초기화 시점. handler 객체는 호출마다 새로 만들어지므로 handler의 멤버로 재면 언제나 `0s`다 |
 | `ChannelName`의 빈 값 | `null`이므로 `?? "(none)"`로 바꾼다 | `std::optional`이 비어 있고, `value_or("")`로 빈 문자열을 낸다 |
